@@ -3,6 +3,7 @@ let latestAnswerMarkdown = "";
 
 function setPrompt(text) {
     document.getElementById("userInput").value = text;
+    document.getElementById("userInput").focus();
 }
 
 function setLoading(isLoading) {
@@ -23,14 +24,12 @@ function setLoading(isLoading) {
 
 function showError(message) {
     const errorBox = document.getElementById("errorBox");
-
     errorBox.textContent = message;
     errorBox.classList.remove("hidden");
 }
 
 function hideError() {
     const errorBox = document.getElementById("errorBox");
-
     errorBox.classList.add("hidden");
     errorBox.textContent = "";
 }
@@ -49,9 +48,7 @@ function showResult(answer, threadId) {
     }
 
     threadInfo.textContent = `Thread ID: ${threadId}`;
-
     resultSection.classList.remove("hidden");
-
     resultSection.scrollIntoView({
         behavior: "smooth",
         block: "start"
@@ -71,6 +68,9 @@ async function sendMessage() {
 
     setLoading(true);
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 180000);
+
     try {
         const response = await fetch("/api/travel", {
             method: "POST",
@@ -80,7 +80,8 @@ async function sendMessage() {
             body: JSON.stringify({
                 message: message,
                 thread_id: currentThreadId
-            })
+            }),
+            signal: controller.signal
         });
 
         const data = await response.json();
@@ -89,14 +90,23 @@ async function sendMessage() {
             throw new Error(data.error || "Something went wrong.");
         }
 
+        if (!data.answer || !String(data.answer).trim()) {
+            throw new Error(
+                "The itinerary agent returned an empty plan. Please try again in a moment."
+            );
+        }
+
         currentThreadId = data.thread_id;
         localStorage.setItem("travel_thread_id", currentThreadId);
-
         showResult(data.answer, data.thread_id);
-
     } catch (error) {
-        showError(error.message);
+        if (error.name === "AbortError") {
+            showError("Request timed out while building your itinerary. Please try again.");
+        } else {
+            showError(error.message || "Could not generate a travel plan.");
+        }
     } finally {
+        clearTimeout(timeoutId);
         setLoading(false);
     }
 }
@@ -112,8 +122,11 @@ function copyResult() {
     navigator.clipboard.writeText(text)
         .then(() => {
             const copyBtn = document.querySelector(".copy-btn");
-            const oldText = copyBtn.textContent;
+            if (!copyBtn) {
+                return;
+            }
 
+            const oldText = copyBtn.textContent;
             copyBtn.textContent = "Copied!";
 
             setTimeout(() => {
@@ -134,10 +147,12 @@ function downloadPDF() {
     }
 
     const downloadBtn = document.querySelector(".download-btn");
-    const oldText = downloadBtn.textContent;
+    const oldText = downloadBtn ? downloadBtn.textContent : "";
 
-    downloadBtn.textContent = "Preparing PDF...";
-    downloadBtn.disabled = true;
+    if (downloadBtn) {
+        downloadBtn.textContent = "Preparing PDF...";
+        downloadBtn.disabled = true;
+    }
 
     const options = {
         margin: 0.5,
@@ -166,18 +181,22 @@ function downloadPDF() {
         .from(pdfContent)
         .save()
         .then(() => {
-            downloadBtn.textContent = oldText;
-            downloadBtn.disabled = false;
+            if (downloadBtn) {
+                downloadBtn.textContent = oldText;
+                downloadBtn.disabled = false;
+            }
         })
         .catch(() => {
-            downloadBtn.textContent = oldText;
-            downloadBtn.disabled = false;
+            if (downloadBtn) {
+                downloadBtn.textContent = oldText;
+                downloadBtn.disabled = false;
+            }
             showError("Could not download PDF.");
         });
 }
 
 document.addEventListener("keydown", function (event) {
-    if (event.ctrlKey && event.key === "Enter") {
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
         sendMessage();
     }
 });

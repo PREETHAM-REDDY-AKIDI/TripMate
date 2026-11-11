@@ -1,15 +1,18 @@
-import os 
+import os
+from pathlib import Path
 import certifi
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
-# Disable LangSmith tracing if not configured (suppresses connection error noise)
-if not os.getenv("LANGCHAIN_API_KEY") or not os.getenv("LANGCHAIN_ENDPOINT"):
+# Disable LangSmith tracing unless explicitly enabled (avoids DNS/connection hangs)
+_tracing = (os.getenv("LANGSMITH_TRACING") or os.getenv("LANGCHAIN_TRACING_V2") or "").strip().lower()
+if _tracing not in {"true", "1", "yes"}:
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
+    os.environ["LANGSMITH_TRACING"] = "false"
 
 from typing import TypedDict, Annotated
 import operator
@@ -57,12 +60,70 @@ if not GROQ_API_KEY:
 # =========================
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+# gpt-oss models spend many tokens on hidden reasoning; keep headroom for visible content
+GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "4096"))
 
 llm = ChatGroq(
     model=GROQ_MODEL,
     api_key=GROQ_API_KEY,
-    max_tokens=900
+    max_tokens=GROQ_MAX_TOKENS,
+    temperature=0.4,
 )
+
+
+def _message_text(response) -> str:
+    """Extract visible text from Groq/LangChain responses (handles reasoning models)."""
+    content = getattr(response, "content", "") or ""
+
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text") or block.get("content") or ""
+                if text:
+                    parts.append(str(text))
+        content = "\n".join(parts)
+
+    content = str(content).strip()
+    if content:
+        return content
+
+    # Fallback if the model used the full budget on reasoning and left content empty
+    reasoning = (getattr(response, "additional_kwargs", {}) or {}).get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip()
+
+    return ""
+
+
+def _invoke_llm(system_prompt: str, user_prompt: str, retries: int = 2) -> str:
+    """Invoke LLM with retries when a reasoning model returns empty content."""
+    last_error = None
+
+    for attempt in range(retries + 1):
+        try:
+            if attempt:
+                time.sleep(2)
+
+            response = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
+            ])
+            text = _message_text(response)
+            if text:
+                return text
+        except Exception as exc:
+            last_error = exc
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(
+        "The itinerary model returned an empty response. "
+        "Try again, or raise GROQ_MAX_TOKENS / switch GROQ_MODEL."
+    )
 
 
 # =========================
@@ -133,17 +194,18 @@ Hotel Results:
 {state['hotel_results']}
 
 Make the itinerary practical, budget-aware, and easy to follow.
+Write the final itinerary only — no hidden notes.
 """
 
-    time.sleep(5)  # pace requests to stay within Groq free-tier OTPM limit
-    response = llm.invoke([
-        SystemMessage(content="You are an expert travel planner."),
-        HumanMessage(content=prompt)
-    ])
+    time.sleep(2)  # pace requests to stay within Groq free-tier OTPM limit
+    itinerary = _invoke_llm(
+        "You are an expert travel planner. Always return a complete visible itinerary.",
+        prompt,
+    )
 
     return {
-        "itinerary": response.content,
-        "messages": [response],
+        "itinerary": itinerary,
+        "messages": [AIMessage(content=itinerary)],
         "llm_calls": state.get("llm_calls", 0) + 1
     }
 
@@ -154,6 +216,12 @@ Make the itinerary practical, budget-aware, and easy to follow.
 # =========================
 
 def final_agent(state: TravelState):
+    itinerary = (state.get("itinerary") or "").strip()
+    if not itinerary:
+        raise RuntimeError(
+            "Itinerary agent returned no content, so the final plan could not be built."
+        )
+
     final_prompt = f"""
 Generate the final travel response for the user.
 
@@ -167,7 +235,7 @@ Hotels:
 {state['hotel_results']}
 
 Itinerary:
-{state['itinerary']}
+{itinerary}
 
 Format the final answer beautifully using these sections:
 
@@ -182,16 +250,17 @@ Important:
 - Be clear and practical.
 - Mention that live flight API may not provide ticket prices if pricing is unavailable.
 - Keep the response useful for real travel planning.
+- Return only the final visible answer.
 """
 
-    time.sleep(5)  # pace requests to stay within Groq free-tier OTPM limit
-    response = llm.invoke([
-        SystemMessage(content="You are a professional AI travel booking assistant."),
-        HumanMessage(content=final_prompt)
-    ])
+    time.sleep(2)  # pace requests to stay within Groq free-tier OTPM limit
+    answer = _invoke_llm(
+        "You are a professional AI travel booking assistant.",
+        final_prompt,
+    )
 
     return {
-        "messages": [response],
+        "messages": [AIMessage(content=answer)],
         "llm_calls": state.get("llm_calls", 0) + 1
     }
 
